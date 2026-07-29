@@ -24,12 +24,12 @@ func ConnectDatabases(ctx context.Context) (*Databases, error) {
 
 	neonURL := os.Getenv("NEON_DATABASE_URL")
 	if neonURL == "" {
-		neonURL = "NEON_DATABASE_URL_PLACEHOLDER"
+		return nil, fmt.Errorf("NEON_DATABASE_URL is not set. Set it in .env file or as environment variable")
 	}
 
 	nvdURL := os.Getenv("NVD_DATABASE_URL")
 	if nvdURL == "" {
-		nvdURL = "NVD_DATABASE_URL_PLACEHOLDER"
+		return nil, fmt.Errorf("NVD_DATABASE_URL is not set. Set it in .env file or as environment variable")
 	}
 
 	neonConfig, err := pgxpool.ParseConfig(neonURL)
