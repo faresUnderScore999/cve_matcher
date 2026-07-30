@@ -7,23 +7,38 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"nvd-engine/pkd/db"
 	"nvd-engine/pkd/models"
+
+	"github.com/jackc/pgx/v5"
 )
 
-func MatchTargetAgainstNvd(ctx context.Context, dbs *db.Databases, target models.TargetItem) ([]models.AffectedAssetFinding, error) {
-	// Search raw_json for vendor/product matching inside configurations
+// CveLookupResult holds all CVE data for a single vendor/product pair query
+type CveLookupResult struct {
+	CveID         string
+	RawJson       []byte
+	DefaultStatus string
+	Versions      []models.CveVersion
+}
+
+// fetchCvesByVendorProduct queries the NVD database once for a vendor/product pair
+// and returns all matching CVEs grouped by cve_id.
+func fetchCvesByVendorProduct(ctx context.Context, dbs *db.Databases, vendor, product string) ([]CveLookupResult, error) {
 	query := `
-		SELECT cve_id, raw_json 
-		FROM cve_records 
-		WHERE raw_json->'configurations' IS NOT NULL 
-		  AND raw_json::text ILIKE $1 
-		  AND raw_json::text ILIKE $2;
+		SELECT cr.cve_id, cr.raw_json,
+		       COALESCE(ca.default_status, ''),
+		       COALESCE(cv.version, ''),
+		       COALESCE(cv.status, ''),
+		       COALESCE(cv.less_than, ''),
+		       COALESCE(cv.less_than_or_equal, '')
+		FROM cve_records cr
+		JOIN cve_affected ca ON ca.cve_id = cr.cve_id
+		LEFT JOIN cve_versions cv ON cv.affected_id = ca.id
+		WHERE ca.vendor ILIKE $1 AND ca.product ILIKE $2;
 	`
 
-	vendorPattern := "%" + target.Vendor + "%"
-	productPattern := "%" + target.Product + "%"
+	vendorPattern := "%" + vendor + "%"
+	productPattern := "%" + product + "%"
 
 	rows, err := dbs.NvdDB.Query(ctx, query, vendorPattern, productPattern)
 	if err != nil {
@@ -31,103 +46,201 @@ func MatchTargetAgainstNvd(ctx context.Context, dbs *db.Databases, target models
 	}
 	defer rows.Close()
 
-	var findings []models.AffectedAssetFinding
+	groupMap := make(map[string]*CveLookupResult)
+	var orderedKeys []string
 
 	for rows.Next() {
-		var cveID string
-		var rawJsonBytes []byte
+		var cveID, defaultStatus, version, status, lessThan, lessThanOrEq string
+		var rawJson []byte
 
-		if err := rows.Scan(&cveID, &rawJsonBytes); err != nil {
+		if err := rows.Scan(&cveID, &rawJson, &defaultStatus, &version, &status, &lessThan, &lessThanOrEq); err != nil {
 			continue
 		}
 
-		var payload models.NvdRawJson
-		if err := json.Unmarshal(rawJsonBytes, &payload); err != nil {
-			continue
+		grp, exists := groupMap[cveID]
+		if !exists {
+			grp = &CveLookupResult{
+				CveID:         cveID,
+				RawJson:       rawJson,
+				DefaultStatus: defaultStatus,
+			}
+			groupMap[cveID] = grp
+			orderedKeys = append(orderedKeys, cveID)
 		}
 
-		// Version Comparison Logic
-		if isAffected(target.Version, payload.Configurations) {
-			score, severity := extractCvss(payload.Metrics)
+		// Only add version entry if at least one version field is non-empty
+		if version != "" || lessThan != "" || lessThanOrEq != "" {
+			grp.Versions = append(grp.Versions, models.CveVersion{
+				Version:         version,
+				Status:          status,
+				LessThan:        lessThan,
+				LessThanOrEqual: lessThanOrEq,
+			})
+		}
+	}
+
+	result := make([]CveLookupResult, 0, len(orderedKeys))
+	for _, key := range orderedKeys {
+		result = append(result, *groupMap[key])
+	}
+	return result, nil
+}
+
+// matchTargetAgainstCves checks a single target against pre-fetched CVE lookup results.
+// No database queries are made — all matching is done in-memory.
+func matchTargetAgainstCves(target models.TargetItem, cves []CveLookupResult) []models.AffectedAssetFinding {
+	var findings []models.AffectedAssetFinding
+
+	for _, cve := range cves {
+		if isVersionAffected(target.Version, cve.DefaultStatus, cve.Versions) {
+			score, severity := extractCvssFromRaw(cve.RawJson)
 			findings = append(findings, models.AffectedAssetFinding{
 				AssetID:   target.AssetID,
-				CveID:     cveID,
+				CveID:     cve.CveID,
 				CvssScore: score,
 				Severity:  severity,
 			})
 		}
 	}
 
-	return findings, nil
+	return findings
 }
 
-func extractCvss(metrics models.NvdMetrics) (float64, string) {
-	if len(metrics.CvssMetricV31) > 0 {
-		data := metrics.CvssMetricV31[0].CvssData
-		return data.BaseScore, data.BaseSeverity
+// MatchTargetAgainstNvd matches a single target against the NVD database.
+// For batch processing multiple targets that share the same vendor/product,
+// use MatchBatchTargets instead for better performance.
+func MatchTargetAgainstNvd(ctx context.Context, dbs *db.Databases, target models.TargetItem) ([]models.AffectedAssetFinding, error) {
+	cves, err := fetchCvesByVendorProduct(ctx, dbs, target.Vendor, target.Product)
+	if err != nil {
+		return nil, err
+	}
+	return matchTargetAgainstCves(target, cves), nil
+}
+
+// MatchBatchTargets matches multiple targets that share the same vendor/product
+// against the NVD database using a single query. This is much more efficient
+// than calling MatchTargetAgainstNvd for each target individually.
+func MatchBatchTargets(ctx context.Context, dbs *db.Databases, vendor, product string, targets []models.TargetItem) ([]MatchResult, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+
+	// Single database query for all targets with this vendor/product
+	cves, err := fetchCvesByVendorProduct(ctx, dbs, vendor, product)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(cves) == 0 {
+		// No CVEs found for this vendor/product — no findings for any target
+		return nil, nil
+	}
+
+	// Match each target against the cached CVE results (in-memory, no DB queries)
+	var results []MatchResult
+	for _, target := range targets {
+		findings := matchTargetAgainstCves(target, cves)
+		if len(findings) > 0 {
+			results = append(results, MatchResult{
+				Target:   target,
+				Findings: findings,
+			})
+		}
+	}
+
+	return results, nil
+}
+
+// extractCvssFromRaw extracts CVSS v3.1 base score and severity from raw_json bytes
+func extractCvssFromRaw(rawJson []byte) (float64, string) {
+	var doc struct {
+		Metrics struct {
+			CvssMetricV31 []struct {
+				CvssData struct {
+					BaseScore    float64 `json:"baseScore"`
+					BaseSeverity string  `json:"baseSeverity"`
+				} `json:"cvssData"`
+			} `json:"cvssMetricV31"`
+		} `json:"metrics"`
+	}
+	if err := json.Unmarshal(rawJson, &doc); err != nil {
+		return 0.0, "UNKNOWN"
+	}
+	if len(doc.Metrics.CvssMetricV31) > 0 {
+		d := doc.Metrics.CvssMetricV31[0].CvssData
+		return d.BaseScore, d.BaseSeverity
 	}
 	return 0.0, "UNKNOWN"
 }
 
-func isAffected(assetVersion string, configs []models.NvdConfigNode) bool {
-	for _, config := range configs {
-		for _, node := range config.Nodes {
-			for _, match := range node.CpeMatch {
-				if IsVersionAffected(assetVersion, match) {
-					return true
-				}
+// isVersionAffected determines if the asset version is affected by a CVE
+// based on the version entries and default status.
+func isVersionAffected(assetVersion, defaultStatus string, versions []models.CveVersion) bool {
+	if len(versions) == 0 {
+		// No version constraints: use default_status
+		return defaultStatus == "affected"
+	}
+
+	// Track explicit matches
+	var matchedAffected, matchedUnaffected bool
+
+	for _, v := range versions {
+		if isVersionMatch(assetVersion, v) {
+			switch v.Status {
+			case "affected":
+				matchedAffected = true
+			case "unaffected":
+				matchedUnaffected = true
 			}
 		}
 	}
-	return false
-}
 
-// IsVersionAffected checks if the given asset version falls within the vulnerable range
-// defined by the CPE match criteria.
-func IsVersionAffected(assetVersion string, match models.CpeMatch) bool {
-	if !match.Vulnerable {
+	// If any unaffected match overrides, the asset is NOT affected
+	if matchedUnaffected {
 		return false
 	}
 
+	// If any affected match found, the asset IS affected
+	if matchedAffected {
+		return true
+	}
+
+	// No version entries matched: fall back to default_status
+	return defaultStatus == "affected"
+}
+
+// isVersionMatch checks if the asset version matches a single version constraint
+func isVersionMatch(assetVersion string, v models.CveVersion) bool {
 	if assetVersion == "" {
-		// If no version specified, consider it affected only if there's no version constraints
-		return match.VersionStartIncluding == "" &&
-			match.VersionStartExcluding == "" &&
-			match.VersionEndIncluding == "" &&
-			match.VersionEndExcluding == ""
+		// No asset version: only match if there are no constraints
+		return v.Version == "" && v.LessThan == "" && v.LessThanOrEqual == ""
 	}
 
-	// Check version start constraints
-	if match.VersionStartIncluding != "" {
-		cmp := compareVersions(assetVersion, match.VersionStartIncluding)
-		if cmp == models.VersionInvalid || cmp == models.VersionLess {
-			return false
+	// Exact version match
+	if v.Version != "" {
+		cmp := compareVersions(assetVersion, v.Version)
+		if cmp == models.VersionEqual {
+			return true
 		}
 	}
 
-	if match.VersionStartExcluding != "" {
-		cmp := compareVersions(assetVersion, match.VersionStartExcluding)
-		if cmp == models.VersionInvalid || cmp == models.VersionLess || cmp == models.VersionEqual {
-			return false
+	// less_than constraint: assetVersion < v.LessThan
+	if v.LessThan != "" {
+		cmp := compareVersions(assetVersion, v.LessThan)
+		if cmp == models.VersionLess {
+			return true
 		}
 	}
 
-	// Check version end constraints
-	if match.VersionEndIncluding != "" {
-		cmp := compareVersions(assetVersion, match.VersionEndIncluding)
-		if cmp == models.VersionInvalid || cmp == models.VersionGreater {
-			return false
+	// less_than_or_equal constraint: assetVersion <= v.LessThanOrEqual
+	if v.LessThanOrEqual != "" {
+		cmp := compareVersions(assetVersion, v.LessThanOrEqual)
+		if cmp == models.VersionLess || cmp == models.VersionEqual {
+			return true
 		}
 	}
 
-	if match.VersionEndExcluding != "" {
-		cmp := compareVersions(assetVersion, match.VersionEndExcluding)
-		if cmp == models.VersionInvalid || cmp == models.VersionGreater || cmp == models.VersionEqual {
-			return false
-		}
-	}
-
-	return true
+	return false
 }
 
 // compareVersions compares two version strings numerically.

@@ -1,1 +1,21 @@
+# Environment variables (contains credentials)
 .env
+.env.local
+
+# Built binary
+cve-matcher
+cve-matcher.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/

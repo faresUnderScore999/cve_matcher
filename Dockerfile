@@ -18,15 +18,15 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/matcher ./cmd/mat
 # Runtime stage
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata dcron
 
 WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /app/matcher .
 
-# Copy .env file if present (for local development)
-COPY .env* ./
+# Create crontab: run matcher daily at 5am, redirect output to Docker logs
+RUN echo "0 5 * * * /app/matcher > /proc/1/fd/1 2>&1" > /var/spool/cron/crontabs/root
 
-# Run the matcher
-ENTRYPOINT ["/app/matcher"]
+# Start cron in foreground (keeps container alive and logs to stdout)
+CMD ["crond", "-f", "-l", "2"]

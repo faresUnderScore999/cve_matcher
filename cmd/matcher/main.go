@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -47,6 +48,12 @@ func main() {
 	log.Println("NVD Asset Matcher completed successfully")
 }
 
+// vendorProductKey is a unique key for grouping targets by vendor/product pair
+type vendorProductKey struct {
+	vendor  string
+	product string
+}
+
 func runMatching(ctx context.Context, dbs *db.Databases) error {
 	startTime := time.Now()
 	log.Println("Starting asset-CVE matching process...")
@@ -64,15 +71,45 @@ func runMatching(ctx context.Context, dbs *db.Databases) error {
 		return nil
 	}
 
-	// Step 2: Match each target against NVD database
+	// Step 2: Group targets by (vendor, product) to batch database queries
+	groups := make(map[vendorProductKey][]models.TargetItem)
+	for _, t := range targets {
+		key := vendorProductKey{vendor: t.Vendor, product: t.Product}
+		groups[key] = append(groups[key], t)
+	}
+	log.Printf("Grouped into %d unique (vendor, product) pairs (vs %d individual assets)", len(groups), len(targets))
+
+	// Step 3: Process each group in parallel
 	var (
-		allFindings []matcher.MatchResult
-		mu          sync.Mutex
-		wg          sync.WaitGroup
-		semaphore   = make(chan struct{}, 5) // Limit concurrency to 5
+		allMatches     []matcher.MatchResult
+		mu             sync.Mutex
+		wg             sync.WaitGroup
+		semaphore      = make(chan struct{}, 5) // Limit concurrency to 5
+		totalCvesFound int
 	)
 
-	for i, target := range targets {
+	// Sort keys for deterministic ordering
+	type groupEntry struct {
+		key   vendorProductKey
+		count int
+	}
+	var sortedGroups []groupEntry
+	for k, v := range groups {
+		sortedGroups = append(sortedGroups, groupEntry{key: k, count: len(v)})
+	}
+	sort.Slice(sortedGroups, func(i, j int) bool {
+		if sortedGroups[i].key.vendor != sortedGroups[j].key.vendor {
+			return sortedGroups[i].key.vendor < sortedGroups[j].key.vendor
+		}
+		return sortedGroups[i].key.product < sortedGroups[j].key.product
+	})
+
+	groupIndex := 0
+	for _, entry := range sortedGroups {
+		groupIndex++
+		key := entry.key
+		batch := groups[key]
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -82,42 +119,55 @@ func runMatching(ctx context.Context, dbs *db.Databases) error {
 		wg.Add(1)
 		semaphore <- struct{}{} // Acquire semaphore
 
-		go func(idx int, t models.TargetItem) {
+		go func(idx int, vendor, product string, batch []models.TargetItem) {
 			defer wg.Done()
 			defer func() { <-semaphore }() // Release semaphore
 
-			log.Printf("[%d/%d] Matching asset %s (vendor=%s, product=%s, version=%s)",
-				idx+1, len(targets), t.AssetID, t.Vendor, t.Product, t.Version)
+			log.Printf("[Group %d/%d] Querying CVEs for vendor=%s, product=%s (%d assets in group)",
+				idx, len(sortedGroups), vendor, product, len(batch))
 
-			findings, err := matcher.MatchTargetAgainstNvd(ctx, dbs, t)
+			results, err := matcher.MatchBatchTargets(ctx, dbs, vendor, product, batch)
 			if err != nil {
-				log.Printf("Error matching asset %s: %v", t.AssetID, err)
+				log.Printf("Error matching group vendor=%s, product=%s: %v", vendor, product, err)
 				return
 			}
 
-			if len(findings) > 0 {
+			if len(results) > 0 {
+				groupFindings := 0
+				for _, r := range results {
+					groupFindings += len(r.Findings)
+				}
+
 				mu.Lock()
-				allFindings = append(allFindings, matcher.MatchResult{
-					Target:   t,
-					Findings: findings,
-				})
+				allMatches = append(allMatches, results...)
+				totalCvesFound += groupFindings
 				mu.Unlock()
-				log.Printf("Found %d CVE matches for asset %s", len(findings), t.AssetID)
+
+				log.Printf("[Group %d/%d] Found %d CVE matches across %d assets for vendor=%s, product=%s",
+					idx, len(sortedGroups), groupFindings, len(results), vendor, product)
+			} else {
+				log.Printf("[Group %d/%d] No matches for vendor=%s, product=%s (%d assets)",
+					idx, len(sortedGroups), vendor, product, len(batch))
 			}
-		}(i, target)
+		}(groupIndex, key.vendor, key.product, batch)
 	}
 
 	wg.Wait()
 
-	// Step 3: Collect all findings and insert into affected_assets
+	// Step 4: Collect all findings
 	var totalFindings []models.AffectedAssetFinding
-	for _, result := range allFindings {
+	assetsWithFindings := 0
+	for _, result := range allMatches {
 		totalFindings = append(totalFindings, result.Findings...)
+		if len(result.Findings) > 0 {
+			assetsWithFindings++
+		}
 	}
 
-	log.Printf("Total matches found: %d across %d assets", len(totalFindings), len(allFindings))
+	log.Printf("Total: %d CVE matches across %d assets (%d groups processed)",
+		len(totalFindings), assetsWithFindings, len(sortedGroups))
 
-	// Step 4: Insert findings into affected_assets table
+	// Step 5: Insert findings into affected_assets table
 	if len(totalFindings) > 0 {
 		log.Println("Inserting findings into affected_assets table...")
 		if err := matcher.InsertFindings(ctx, dbs, totalFindings); err != nil {
