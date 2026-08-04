@@ -6,9 +6,10 @@ import (
 	"log"
 	"strings"
 
-	"github.com/google/uuid"
 	"nvd-engine/pkd/db"
 	"nvd-engine/pkd/models"
+
+	"github.com/google/uuid"
 )
 
 // MatchResult holds a target item and its matching CVE findings
@@ -75,6 +76,10 @@ func fetchNetworkDevices(ctx context.Context, dbs *db.Databases) ([]models.Targe
 			Version:     version,
 			CpeCriteria: cpe,
 		})
+	}
+	for _, t := range list {
+		log.Printf("[DEBUG TARGET] Type: %-10s | Vendor: %-15s | Product: %-20s | Version: %-10s | ID: %s",
+			t.AssetType, t.Vendor, t.Product, t.Version, t.AssetID)
 	}
 	return list, nil
 }
@@ -151,6 +156,8 @@ func fetchEndpointAssets(ctx context.Context, dbs *db.Databases) ([]models.Targe
 		swTargets := parseSoftwareTargets(id, "endpoint_assets", rawSoftware)
 		list = append(list, swTargets...)
 	}
+	// ==================== TEMP DEBUG START ====================
+
 	return list, nil
 }
 
@@ -276,31 +283,7 @@ func detectWindowsProduct(osLower, osVersion string) string {
 		}
 	}
 
-	// Fallback: detect from name
-	switch {
-	case strings.Contains(osLower, "server 2022"):
-		return "windows_server_2022"
-	case strings.Contains(osLower, "server 2019"):
-		return "windows_server_2019"
-	case strings.Contains(osLower, "server 2016"):
-		return "windows_server_2016"
-	case strings.Contains(osLower, "server 2012"):
-		return "windows_server_2012"
-	case strings.Contains(osLower, "server 2008"):
-		return "windows_server_2008"
-	case strings.Contains(osLower, "11"):
-		return "windows_11"
-	case strings.Contains(osLower, "10"):
-		return "windows_10"
-	case strings.Contains(osLower, "8.1"):
-		return "windows_8_1"
-	case strings.Contains(osLower, "8"):
-		return "windows_8"
-	case strings.Contains(osLower, "7"):
-		return "windows_7"
-	}
-
-	return "windows_10" // broad fallback
+	return "" // broad fallback
 }
 
 // parseSoftwareTargets extracts TargetItem entries from installed_software JSONB
@@ -311,34 +294,23 @@ func parseSoftwareTargets(assetID uuid.UUID, assetType string, rawSoftware []byt
 
 	var list []models.TargetItem
 
-	// JSONB can be an object map or array depending on backend serialization
-	var items []models.InstalledSoftwareItem
-	if err := json.Unmarshal(rawSoftware, &items); err != nil {
-		// Fallback: Try unmarshalling map if format is key-value pairs
-		var itemMap map[string]models.InstalledSoftwareItem
-		if errMap := json.Unmarshal(rawSoftware, &itemMap); errMap == nil {
-			for _, v := range itemMap {
-				items = append(items, v)
-			}
-		} else {
-			return nil
-		}
-	}
-
-	for _, sw := range items {
-		prod := sw.Product
-		if prod == "" {
-			prod = sw.Name
-		}
-		if prod != "" {
+	// NEW: Try map of strings (key = name, value = version)
+	var strMap map[string]string
+	if err := json.Unmarshal(rawSoftware, &strMap); err == nil {
+		for name, version := range strMap {
+			// Infer vendor from name (optional) or leave empty
+			vendor := ""
+			// You could add heuristics, e.g., if strings.Contains(name, "VMware") -> vendor="vmware"
 			list = append(list, models.TargetItem{
 				AssetID:   assetID,
 				AssetType: assetType,
-				Vendor:    sw.Vendor,
-				Product:   prod,
-				Version:   sw.Version,
+				Vendor:    vendor,
+				Product:   name,
+				Version:   version,
 			})
 		}
+		return list
 	}
-	return list
+
+	return nil
 }

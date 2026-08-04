@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -24,6 +25,8 @@ type CveLookupResult struct {
 // fetchCvesByVendorProduct queries the NVD database once for a vendor/product pair
 // and returns all matching CVEs grouped by cve_id.
 func fetchCvesByVendorProduct(ctx context.Context, dbs *db.Databases, vendor, product string) ([]CveLookupResult, error) {
+	// 1. SQL Query using REGEXP_REPLACE and LOWER to ignore spaces, punctuation, and casing.
+	// regexp_replace(str, '[^a-zA-Z0-9]', '', 'g') removes all non-alphanumeric characters.
 	query := `
 		SELECT cr.cve_id, cr.raw_json,
 		       COALESCE(ca.default_status, ''),
@@ -34,13 +37,27 @@ func fetchCvesByVendorProduct(ctx context.Context, dbs *db.Databases, vendor, pr
 		FROM cve_records cr
 		JOIN cve_affected ca ON ca.cve_id = cr.cve_id
 		LEFT JOIN cve_versions cv ON cv.affected_id = ca.id
-		WHERE ca.vendor ILIKE $1 AND ca.product ILIKE $2;
+		WHERE ($1 = '' OR LOWER(REGEXP_REPLACE(ca.vendor, '[^a-zA-Z0-9]', '', 'g')) LIKE $2) 
+		  AND LOWER(REGEXP_REPLACE(ca.product, '[^a-zA-Z0-9]', '', 'g')) LIKE $3;
 	`
 
-	vendorPattern := "%" + vendor + "%"
-	productPattern := "%" + product + "%"
+	// 2. Helper function to sanitize Go input strings identically
+	sanitize := func(s string) string {
+		reg := regexp.MustCompile(`[^a-zA-Z0-9]+`)
+		return strings.ToLower(reg.ReplaceAllString(s, ""))
+	}
 
-	rows, err := dbs.NvdDB.Query(ctx, query, vendorPattern, productPattern)
+	cleanVendor := sanitize(vendor)
+	cleanProduct := sanitize(product)
+
+	vendorPattern := ""
+	if cleanVendor != "" {
+		vendorPattern = "%" + cleanVendor + "%"
+	}
+	productPattern := "%" + cleanProduct + "%"
+
+	// 3. Execute query with cleaned input parameters
+	rows, err := dbs.NvdDB.Query(ctx, query, cleanVendor, vendorPattern, productPattern)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +85,6 @@ func fetchCvesByVendorProduct(ctx context.Context, dbs *db.Databases, vendor, pr
 			orderedKeys = append(orderedKeys, cveID)
 		}
 
-		// Only add version entry if at least one version field is non-empty
 		if version != "" || lessThan != "" || lessThanOrEq != "" {
 			grp.Versions = append(grp.Versions, models.CveVersion{
 				Version:         version,
@@ -84,6 +100,156 @@ func fetchCvesByVendorProduct(ctx context.Context, dbs *db.Databases, vendor, pr
 		result = append(result, *groupMap[key])
 	}
 	return result, nil
+}
+
+// fetchCvesByCpeTable queries the cve_cpes table joined with cve_records to find
+// CVEs that match a vendor/product via CPE strings. This is a fallback/merge source
+// for CVEs that may not be captured by the cve_affected/cve_versions tables.
+func fetchCvesByCpeTable(ctx context.Context, dbs *db.Databases, vendor, product string) ([]CveLookupResult, error) {
+	// Query cve_cpes joined with cve_records to get the raw_json metrics
+	query := `
+		SELECT cr.cve_id, cr.raw_json, cc.cpe,
+		       COALESCE(cc.version_start_including, ''),
+		       COALESCE(cc.version_end_excluding, ''),
+		       COALESCE(cc.version_start_excluding, ''),
+		       COALESCE(cc.version_end_including, '')
+		FROM cve_cpes cc
+		JOIN cve_records cr ON cr.cve_id = cc.cve_id
+		WHERE cc.vulnerable = true
+		  AND ($1 = '' OR LOWER(REGEXP_REPLACE(split_part(cc.cpe, ':', 4), '[^a-zA-Z0-9]', '', 'g')) LIKE $2)
+		  AND LOWER(REGEXP_REPLACE(split_part(cc.cpe, ':', 5), '[^a-zA-Z0-9]', '', 'g')) LIKE $3;
+	`
+
+	// Helper to sanitize vendor/product strings
+	sanitize := func(s string) string {
+		reg := regexp.MustCompile(`[^a-zA-Z0-9]+`)
+		return strings.ToLower(reg.ReplaceAllString(s, ""))
+	}
+
+	cleanVendor := sanitize(vendor)
+	cleanProduct := sanitize(product)
+
+	vendorPattern := ""
+	if cleanVendor != "" {
+		vendorPattern = "%" + cleanVendor + "%"
+	}
+	productPattern := "%" + cleanProduct + "%"
+
+	rows, err := dbs.NvdDB.Query(ctx, query, cleanVendor, vendorPattern, productPattern)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	groupMap := make(map[string]*CveLookupResult)
+	var orderedKeys []string
+
+	for rows.Next() {
+		var cveID, cpe, vStartInc, vEndExc, vStartExc, vEndInc string
+		var rawJson []byte
+
+		if err := rows.Scan(&cveID, &rawJson, &cpe, &vStartInc, &vEndExc, &vStartExc, &vEndInc); err != nil {
+			continue
+		}
+
+		grp, exists := groupMap[cveID]
+		if !exists {
+			grp = &CveLookupResult{
+				CveID:         cveID,
+				RawJson:       rawJson,
+				DefaultStatus: "unaffected", // Fallback default status for cve_cpes
+			}
+			groupMap[cveID] = grp
+			orderedKeys = append(orderedKeys, cveID)
+		}
+
+		// Map range bounds into CveVersion records
+		if vStartInc != "" || vEndExc != "" || vStartExc != "" || vEndInc != "" {
+			// Version boundary: >= vStartInc
+			if vStartInc != "" {
+				grp.Versions = append(grp.Versions, models.CveVersion{
+					GreaterThanOrEqual: vStartInc,
+					Status:             "affected",
+				})
+			}
+			// Boundary: > vStartExc
+			if vStartExc != "" {
+				grp.Versions = append(grp.Versions, models.CveVersion{
+					GreaterThan: vStartExc,
+					Status:      "affected",
+				})
+			}
+			// Boundary: < vEndExc
+			if vEndExc != "" {
+				grp.Versions = append(grp.Versions, models.CveVersion{
+					LessThan: vEndExc,
+					Status:   "affected",
+				})
+			}
+			// Boundary: <= vEndInc
+			if vEndInc != "" {
+				grp.Versions = append(grp.Versions, models.CveVersion{
+					LessThanOrEqual: vEndInc,
+					Status:          "affected",
+				})
+			}
+		} else {
+			// If no explicit ranges, check if version is embedded inside CPE field 6
+			// e.g., cpe:2.3:a:meddream:pacs_server:7.3.6.870:*:*:*
+			cpeParts := strings.Split(cpe, ":")
+			if len(cpeParts) >= 6 && cpeParts[5] != "*" && cpeParts[5] != "-" {
+				grp.Versions = append(grp.Versions, models.CveVersion{
+					Version: cpeParts[5],
+					Status:  "affected",
+				})
+			}
+		}
+	}
+
+	result := make([]CveLookupResult, 0, len(orderedKeys))
+	for _, key := range orderedKeys {
+		result = append(result, *groupMap[key])
+	}
+	return result, nil
+}
+
+// mergeCveResults merges two CVE lookup result slices, deduplicating by cve_id.
+// The first occurrence's RawJson and DefaultStatus are kept; Versions are appended
+// from both sources (deduplicated by their string representation).
+func mergeCveResults(a, b []CveLookupResult) []CveLookupResult {
+	merged := make([]CveLookupResult, 0, len(a)+len(b))
+	seen := make(map[string]int) // cve_id -> index in merged
+
+	for _, cve := range a {
+		merged = append(merged, cve)
+		seen[cve.CveID] = len(merged) - 1
+	}
+
+	for _, cve := range b {
+		if idx, exists := seen[cve.CveID]; exists {
+			// Merge versions, avoiding duplicates
+			existing := &merged[idx]
+			existingVersions := make(map[string]bool)
+			for _, v := range existing.Versions {
+				existingVersions[versionKey(v)] = true
+			}
+			for _, v := range cve.Versions {
+				if !existingVersions[versionKey(v)] {
+					existing.Versions = append(existing.Versions, v)
+				}
+			}
+		} else {
+			merged = append(merged, cve)
+			seen[cve.CveID] = len(merged) - 1
+		}
+	}
+
+	return merged
+}
+
+// versionKey returns a unique string key for a CveVersion for deduplication
+func versionKey(v models.CveVersion) string {
+	return v.Version + "|" + v.Status + "|" + v.LessThan + "|" + v.LessThanOrEqual + "|" + v.GreaterThan + "|" + v.GreaterThanOrEqual
 }
 
 // matchTargetAgainstCves checks a single target against pre-fetched CVE lookup results.
@@ -106,30 +272,27 @@ func matchTargetAgainstCves(target models.TargetItem, cves []CveLookupResult) []
 	return findings
 }
 
-// MatchTargetAgainstNvd matches a single target against the NVD database.
-// For batch processing multiple targets that share the same vendor/product,
-// use MatchBatchTargets instead for better performance.
-func MatchTargetAgainstNvd(ctx context.Context, dbs *db.Databases, target models.TargetItem) ([]models.AffectedAssetFinding, error) {
-	cves, err := fetchCvesByVendorProduct(ctx, dbs, target.Vendor, target.Product)
-	if err != nil {
-		return nil, err
-	}
-	return matchTargetAgainstCves(target, cves), nil
-}
-
 // MatchBatchTargets matches multiple targets that share the same vendor/product
 // against the NVD database using a single query. This is much more efficient
-// than calling MatchTargetAgainstNvd for each target individually.
+
 func MatchBatchTargets(ctx context.Context, dbs *db.Databases, vendor, product string, targets []models.TargetItem) ([]MatchResult, error) {
 	if len(targets) == 0 {
 		return nil, nil
 	}
 
-	// Single database query for all targets with this vendor/product
+	// Query CVEs from the cve_affected/cve_versions tables
 	cves, err := fetchCvesByVendorProduct(ctx, dbs, vendor, product)
 	if err != nil {
 		return nil, err
 	}
+
+	// Query CVEs from the cve_cpes table and merge with the first result set
+	cpeCves, err := fetchCvesByCpeTable(ctx, dbs, vendor, product)
+	if err != nil {
+		return nil, err
+	}
+
+	cves = mergeCveResults(cves, cpeCves)
 
 	if len(cves) == 0 {
 		// No CVEs found for this vendor/product — no findings for any target
@@ -173,7 +336,6 @@ func extractCvssFromRaw(rawJson []byte) (float64, string) {
 	return 0.0, "UNKNOWN"
 }
 
-// isVersionAffected determines if the asset version is affected by a CVE
 // based on the version entries and default status.
 func isVersionAffected(assetVersion, defaultStatus string, versions []models.CveVersion) bool {
 	if len(versions) == 0 {
@@ -213,7 +375,8 @@ func isVersionAffected(assetVersion, defaultStatus string, versions []models.Cve
 func isVersionMatch(assetVersion string, v models.CveVersion) bool {
 	if assetVersion == "" {
 		// No asset version: only match if there are no constraints
-		return v.Version == "" && v.LessThan == "" && v.LessThanOrEqual == ""
+		return v.Version == "" && v.LessThan == "" && v.LessThanOrEqual == "" &&
+			v.GreaterThan == "" && v.GreaterThanOrEqual == ""
 	}
 
 	// Exact version match
@@ -236,6 +399,22 @@ func isVersionMatch(assetVersion string, v models.CveVersion) bool {
 	if v.LessThanOrEqual != "" {
 		cmp := compareVersions(assetVersion, v.LessThanOrEqual)
 		if cmp == models.VersionLess || cmp == models.VersionEqual {
+			return true
+		}
+	}
+
+	// greater_than constraint: assetVersion > v.GreaterThan
+	if v.GreaterThan != "" {
+		cmp := compareVersions(assetVersion, v.GreaterThan)
+		if cmp == models.VersionGreater {
+			return true
+		}
+	}
+
+	// greater_than_or_equal constraint: assetVersion >= v.GreaterThanOrEqual
+	if v.GreaterThanOrEqual != "" {
+		cmp := compareVersions(assetVersion, v.GreaterThanOrEqual)
+		if cmp == models.VersionGreater || cmp == models.VersionEqual {
 			return true
 		}
 	}

@@ -35,13 +35,15 @@ type CveAffected struct {
 
 // CveVersion represents a row from the cve_versions table
 type CveVersion struct {
-	ID              int
-	AffectedID      int
-	Version         string
-	Status          string
-	LessThan        string
-	LessThanOrEqual string
-	VersionType     string
+	ID                 int
+	AffectedID         int
+	Version            string
+	Status             string
+	LessThan           string
+	LessThanOrEqual    string
+	GreaterThan        string
+	GreaterThanOrEqual string
+	VersionType        string
 }
 
 // AffectedAssetFinding represents a matched CVE for an asset to be inserted into affected_assets
