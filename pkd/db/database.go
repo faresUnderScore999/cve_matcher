@@ -124,7 +124,7 @@ func ensureNeonOutputTables(ctx context.Context, pool *pgxpool.Pool) error {
 		`,
 		`
 		CREATE TABLE IF NOT EXISTS cve_ticket (
-		    id BIGSERIAL PRIMARY KEY,
+		    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 		    asset_id UUID NOT NULL,
 		    cve_id VARCHAR(20) NOT NULL,
 		    status VARCHAR(20) NOT NULL,

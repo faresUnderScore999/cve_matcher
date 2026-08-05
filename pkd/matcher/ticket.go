@@ -9,6 +9,7 @@ import (
 	"nvd-engine/pkd/db"
 	"nvd-engine/pkd/models"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -38,6 +39,7 @@ var priorityMap = map[string]string{
 // Each ticket is assigned:
 //   - status = "OPEN"
 //   - priority based on severity (CRITICAL→P1, HIGH→P2, MEDIUM→P3, LOW→P4)
+//   - assigned_to = the asset owner's email
 //   - due_date = NOW() + SLA days (CRITICAL=7d, HIGH=14d, MEDIUM=30d, LOW=60d)
 //   - description = summary of the finding
 func CreateTickets(ctx context.Context, dbs *db.Databases, findings []models.AffectedAssetFinding) ([]models.CveTicket, error) {
@@ -49,8 +51,8 @@ func CreateTickets(ctx context.Context, dbs *db.Databases, findings []models.Aff
 	now := time.Now()
 
 	query := `
-		INSERT INTO cve_ticket (asset_id, cve_id, status, priority, description, due_date, created_at, updated_at)
-		VALUES ($1, $2, 'OPEN', $3, $4, $5, $6, $6)
+		INSERT INTO cve_ticket (asset_id, cve_id, status, priority, assigned_to, description, due_date, created_at, updated_at)
+		VALUES ($1, $2, 'OPEN', $3, $4, $5, $6, $7, $7)
 		ON CONFLICT (asset_id, cve_id) DO NOTHING
 		RETURNING id;
 	`
@@ -85,7 +87,7 @@ func CreateTickets(ctx context.Context, dbs *db.Databases, findings []models.Aff
 			f.CveID, f.Product, f.Version, f.Hostname, f.IPAddress,
 		)
 
-		batch.Queue(query, f.AssetID, f.CveID, priority, desc, dueDate, now)
+		batch.Queue(query, f.AssetID, f.CveID, priority, f.OwnerEmail, desc, dueDate, now)
 		pending = append(pending, pendingTicket{
 			finding:  f,
 			priority: priority,
@@ -99,7 +101,7 @@ func CreateTickets(ctx context.Context, dbs *db.Databases, findings []models.Aff
 
 	var newTickets []models.CveTicket
 	for _, p := range pending {
-		var insertedID int64
+		var insertedID uuid.UUID
 		row := br.QueryRow()
 		if err := row.Scan(&insertedID); err != nil {
 			if err == pgx.ErrNoRows {
@@ -114,6 +116,7 @@ func CreateTickets(ctx context.Context, dbs *db.Databases, findings []models.Aff
 			CveID:       p.finding.CveID,
 			Status:      "OPEN",
 			Priority:    p.priority,
+			AssignedTo:  p.finding.OwnerEmail,
 			Description: p.desc,
 			DueDate:     p.dueDate,
 			CreatedAt:   now,

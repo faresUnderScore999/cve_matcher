@@ -81,7 +81,7 @@ CREATE TABLE affected_assets (
 The ticket table stores CVEs matched to assets with SLA tracking:
 ```sql
 CREATE TABLE cve_ticket (
-    id          BIGSERIAL PRIMARY KEY,
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     asset_id    UUID NOT NULL,
     cve_id      VARCHAR(20) NOT NULL,
     status      VARCHAR(20) NOT NULL,
