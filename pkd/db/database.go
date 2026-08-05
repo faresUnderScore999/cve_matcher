@@ -1,3 +1,12 @@
+// Package db manages database connections for the CVE matcher.
+//
+// The matcher uses two databases:
+//   - NeonDB: remote asset inventory (assets, server_assets, endpoint_assets,
+//     network_device_assets, affected_assets)
+//   - NvdDB: local CVE database (cve_records, cve_affected, cve_versions, cve_cpes)
+//
+// Databases is the central handle passed through the pipeline stages
+// (fetch → lookup → write) so each stage can query the appropriate database.
 package db
 
 import (
@@ -11,11 +20,22 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// Databases holds the connection pools for both databases used by the matcher.
+// It is created by ConnectDatabases and passed to all pipeline stages.
 type Databases struct {
 	NeonDB *pgxpool.Pool
 	NvdDB  *pgxpool.Pool
 }
 
+// ConnectDatabases loads environment variables, connects to both databases,
+// and verifies the connections with a ping.
+//
+// Called by main.go at startup.
+// Connection settings:
+//   - NeonDB: max 10 conns, min 2 conns
+//   - NvdDB: max 5 conns, min 1 conn
+//
+// Returns an error if either URL is missing or a connection/ping fails.
 func ConnectDatabases(ctx context.Context) (*Databases, error) {
 	// Load .env file if it exists (ignore error if not found)
 	if err := godotenv.Load(); err != nil {
@@ -76,12 +96,63 @@ func ConnectDatabases(ctx context.Context) (*Databases, error) {
 	}
 	log.Println("Connected to NvdDB successfully")
 
+	if err := ensureNeonOutputTables(ctx, neonPool); err != nil {
+		neonPool.Close()
+		nvdPool.Close()
+		return nil, fmt.Errorf("failed to ensure neon output tables: %w", err)
+	}
+
 	return &Databases{
 		NeonDB: neonPool,
 		NvdDB:  nvdPool,
 	}, nil
 }
 
+func ensureNeonOutputTables(ctx context.Context, pool *pgxpool.Pool) error {
+	queries := []string{
+		`
+		CREATE TABLE IF NOT EXISTS affected_assets (
+		    id SERIAL PRIMARY KEY,
+		    asset_id UUID NOT NULL,
+		    cve_id VARCHAR(50) NOT NULL,
+		    product TEXT,
+		    cvss_score DOUBLE PRECISION,
+		    severity VARCHAR(20),
+		    matched_at TIMESTAMP DEFAULT NOW(),
+		    UNIQUE(asset_id, cve_id)
+		);
+		`,
+		`
+		CREATE TABLE IF NOT EXISTS cve_ticket (
+		    id BIGSERIAL PRIMARY KEY,
+		    asset_id UUID NOT NULL,
+		    cve_id VARCHAR(20) NOT NULL,
+		    status VARCHAR(20) NOT NULL,
+		    priority VARCHAR(10),
+		    assigned_to VARCHAR(100),
+		    description TEXT,
+		    due_date TIMESTAMP,
+		    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+		    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+		    resolved_at TIMESTAMP,
+		    closed_at TIMESTAMP,
+		    UNIQUE(asset_id, cve_id)
+		);
+		`,
+	}
+
+	for _, q := range queries {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			return err
+		}
+	}
+
+	log.Println("Ensured NeonDB output tables exist")
+	return nil
+}
+
+// Close gracefully closes both database connection pools.
+// Called by main() via defer after ConnectDatabases succeeds.
 func (dbs *Databases) Close() {
 	if dbs.NeonDB != nil {
 		dbs.NeonDB.Close()

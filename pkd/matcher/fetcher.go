@@ -2,9 +2,7 @@ package matcher
 
 import (
 	"context"
-	"encoding/json"
 	"log"
-	"strings"
 
 	"nvd-engine/pkd/db"
 	"nvd-engine/pkd/models"
@@ -12,12 +10,22 @@ import (
 	"github.com/google/uuid"
 )
 
-// MatchResult holds a target item and its matching CVE findings
-type MatchResult struct {
-	Target   models.TargetItem
-	Findings []models.AffectedAssetFinding
-}
-
+// FetchAllTargetItems fetches all active assets from NeonDB and converts them
+// into TargetItems for CVE matching.
+//
+// Pipeline stage 1: This is the entry point of the fetch stage.
+// Called by main.go at the start of the matching process.
+//
+// It aggregates targets from three asset types:
+//  1. Network devices (fetchNetworkDevices)
+//  2. Server assets — OS + installed software (fetchServerAssets)
+//  3. Endpoint assets — OS + installed software (fetchEndpointAssets)
+//
+// Errors fetching one asset type are logged but do not abort the whole fetch;
+// the other asset types are still processed.
+//
+// OwnerEmail, Hostname, and IPAddress are fetched from the assets table and
+// carried through the pipeline for ticket creation and email notifications.
 func FetchAllTargetItems(ctx context.Context, dbs *db.Databases) ([]models.TargetItem, error) {
 	var targets []models.TargetItem
 
@@ -48,9 +56,17 @@ func FetchAllTargetItems(ctx context.Context, dbs *db.Databases) ([]models.Targe
 	return targets, nil
 }
 
+// fetchNetworkDevices queries the network_device_assets table for active
+// network devices and converts each row into a TargetItem.
+//
+// Pipeline stage 1: Called by FetchAllTargetItems.
+// Maps: vendor → Vendor, model → Product, firmware_version → Version,
+// firmware_cpe → CpeCriteria. Also carries asset metadata (owner_email,
+// hostname, ip_address) for ticket/notification stages.
 func fetchNetworkDevices(ctx context.Context, dbs *db.Databases) ([]models.TargetItem, error) {
 	query := `
-		SELECT a.asset_id, n.vendor, n.model, COALESCE(n.firmware_version, ''), COALESCE(n.firmware_cpe, '')
+		SELECT a.asset_id, n.vendor, n.model, COALESCE(n.firmware_version, ''), COALESCE(n.firmware_cpe, ''),
+		       COALESCE(a.owner_email, ''), COALESCE(a.hostname, ''), COALESCE(a.ip_address, '')
 		FROM assets a
 		JOIN network_device_assets n ON a.asset_id = n.asset_id
 		WHERE a.status = 'ACTIVE';
@@ -64,8 +80,8 @@ func fetchNetworkDevices(ctx context.Context, dbs *db.Databases) ([]models.Targe
 	var list []models.TargetItem
 	for rows.Next() {
 		var id uuid.UUID
-		var vendor, model, version, cpe string
-		if err := rows.Scan(&id, &vendor, &model, &version, &cpe); err != nil {
+		var vendor, model, version, cpe, ownerEmail, hostname, ipAddress string
+		if err := rows.Scan(&id, &vendor, &model, &version, &cpe, &ownerEmail, &hostname, &ipAddress); err != nil {
 			continue
 		}
 		list = append(list, models.TargetItem{
@@ -75,6 +91,9 @@ func fetchNetworkDevices(ctx context.Context, dbs *db.Databases) ([]models.Targe
 			Product:     model,
 			Version:     version,
 			CpeCriteria: cpe,
+			OwnerEmail:  ownerEmail,
+			Hostname:    hostname,
+			IPAddress:   ipAddress,
 		})
 	}
 	for _, t := range list {
@@ -84,13 +103,20 @@ func fetchNetworkDevices(ctx context.Context, dbs *db.Databases) ([]models.Targe
 	return list, nil
 }
 
+// fetchServerAssets queries the server_assets table for active servers.
+//
+// Pipeline stage 1: Called by FetchAllTargetItems.
+// Each server produces two kinds of TargetItems:
+//   - OS-level targets via buildOSTargets (os_mapping.go)
+//   - Installed software targets via parseSoftwareTargets (software_parser.go)
 func fetchServerAssets(ctx context.Context, dbs *db.Databases) ([]models.TargetItem, error) {
 	query := `
 		SELECT a.asset_id, 
 		       COALESCE(s.os_name, ''), 
 		       COALESCE(s.os_version, ''),
 		       COALESCE(s.kernel_version, ''),
-		       s.installed_software
+		       s.installed_software,
+		       COALESCE(a.owner_email, ''), COALESCE(a.hostname, ''), COALESCE(a.ip_address, '')
 		FROM assets a
 		JOIN server_assets s ON a.asset_id = s.asset_id
 		WHERE a.status = 'ACTIVE';
@@ -104,30 +130,37 @@ func fetchServerAssets(ctx context.Context, dbs *db.Databases) ([]models.TargetI
 	var list []models.TargetItem
 	for rows.Next() {
 		var id uuid.UUID
-		var osName, osVersion, kernelVersion string
+		var osName, osVersion, kernelVersion, ownerEmail, hostname, ipAddress string
 		var rawSoftware []byte
 
-		if err := rows.Scan(&id, &osName, &osVersion, &kernelVersion, &rawSoftware); err != nil {
+		if err := rows.Scan(&id, &osName, &osVersion, &kernelVersion, &rawSoftware, &ownerEmail, &hostname, &ipAddress); err != nil {
 			continue
 		}
 
 		// Add OS-level target items
-		osTargets := buildOSTargets(id, "SERVER", osName, osVersion, kernelVersion)
+		osTargets := buildOSTargets(id, "SERVER", osName, osVersion, kernelVersion, ownerEmail, hostname, ipAddress)
 		list = append(list, osTargets...)
 
 		// Add installed software target items
-		swTargets := parseSoftwareTargets(id, "server_assets", rawSoftware)
+		swTargets := parseSoftwareTargets(id, "server_assets", rawSoftware, ownerEmail, hostname, ipAddress)
 		list = append(list, swTargets...)
 	}
 	return list, nil
 }
 
+// fetchEndpointAssets queries the endpoint_assets table for active endpoints.
+//
+// Pipeline stage 1: Called by FetchAllTargetItems.
+// Each endpoint produces two kinds of TargetItems:
+//   - OS-level targets via buildOSTargets (os_mapping.go) — endpoints have no kernel_version
+//   - Installed software targets via parseSoftwareTargets (software_parser.go)
 func fetchEndpointAssets(ctx context.Context, dbs *db.Databases) ([]models.TargetItem, error) {
 	query := `
 		SELECT a.asset_id, 
 		       COALESCE(e.os_name, ''), 
 		       COALESCE(e.os_version, ''),
-		       e.installed_software
+		       e.installed_software,
+		       COALESCE(a.owner_email, ''), COALESCE(a.hostname, ''), COALESCE(a.ip_address, '')
 		FROM assets a
 		JOIN endpoint_assets e ON a.asset_id = e.asset_id
 		WHERE a.status = 'ACTIVE';
@@ -141,176 +174,21 @@ func fetchEndpointAssets(ctx context.Context, dbs *db.Databases) ([]models.Targe
 	var list []models.TargetItem
 	for rows.Next() {
 		var id uuid.UUID
-		var osName, osVersion string
+		var osName, osVersion, ownerEmail, hostname, ipAddress string
 		var rawSoftware []byte
 
-		if err := rows.Scan(&id, &osName, &osVersion, &rawSoftware); err != nil {
+		if err := rows.Scan(&id, &osName, &osVersion, &rawSoftware, &ownerEmail, &hostname, &ipAddress); err != nil {
 			continue
 		}
 
 		// Add OS-level target items (endpoints don't have kernel_version)
-		osTargets := buildOSTargets(id, "ENDPOINT", osName, osVersion, "")
+		osTargets := buildOSTargets(id, "ENDPOINT", osName, osVersion, "", ownerEmail, hostname, ipAddress)
 		list = append(list, osTargets...)
 
 		// Add installed software target items
-		swTargets := parseSoftwareTargets(id, "endpoint_assets", rawSoftware)
+		swTargets := parseSoftwareTargets(id, "endpoint_assets", rawSoftware, ownerEmail, hostname, ipAddress)
 		list = append(list, swTargets...)
 	}
-	// ==================== TEMP DEBUG START ====================
 
 	return list, nil
-}
-
-// buildOSTargets creates TargetItem entries for OS-level CVE matching.
-// It maps common OS names to their CPE vendor/product equivalents.
-func buildOSTargets(assetID uuid.UUID, assetType, osName, osVersion, kernelVersion string) []models.TargetItem {
-	var targets []models.TargetItem
-
-	osName = strings.TrimSpace(osName)
-	osVersion = strings.TrimSpace(osVersion)
-
-	if osName == "" {
-		return targets
-	}
-
-	// Normalize OS name for matching
-	osLower := strings.ToLower(osName)
-
-	// Map OS names to CPE vendor/product pairs for NVD matching
-	type osMapping struct {
-		vendor  string
-		product string
-	}
-	var mappings []osMapping
-
-	switch {
-	case strings.Contains(osLower, "windows"):
-		mappings = append(mappings, osMapping{vendor: "microsoft", product: "windows"})
-		// Try to detect specific Windows version
-		if v := detectWindowsProduct(osLower, osVersion); v != "" {
-			mappings = append(mappings, osMapping{vendor: "microsoft", product: v})
-		}
-
-	case strings.Contains(osLower, "ubuntu"):
-		mappings = append(mappings, osMapping{vendor: "canonical", product: "ubuntu_linux"})
-
-	case strings.Contains(osLower, "debian"):
-		mappings = append(mappings, osMapping{vendor: "debian", product: "debian_linux"})
-
-	case strings.Contains(osLower, "centos"):
-		mappings = append(mappings, osMapping{vendor: "centos", product: "centos"})
-
-	case strings.Contains(osLower, "rhel") || strings.Contains(osLower, "red hat") || strings.Contains(osLower, "redhat"):
-		mappings = append(mappings, osMapping{vendor: "redhat", product: "enterprise_linux"})
-
-	case strings.Contains(osLower, "fedora"):
-		mappings = append(mappings, osMapping{vendor: "fedoraproject", product: "fedora"})
-
-	case strings.Contains(osLower, "suse") || strings.Contains(osLower, "opensuse"):
-		mappings = append(mappings, osMapping{vendor: "suse", product: "linux"})
-
-	case strings.Contains(osLower, "amazon") || strings.Contains(osLower, "aws"):
-		mappings = append(mappings, osMapping{vendor: "amazon", product: "amazon_linux"})
-
-	case strings.Contains(osLower, "alpine"):
-		mappings = append(mappings, osMapping{vendor: "alpinelinux", product: "alpine_linux"})
-
-	case strings.Contains(osLower, "darwin") || strings.Contains(osLower, "macos") || strings.Contains(osLower, "mac os"):
-		mappings = append(mappings, osMapping{vendor: "apple", product: "macos"})
-
-	case strings.Contains(osLower, "linux"):
-		// Generic Linux - also add kernel-level matching if kernel version is available
-		mappings = append(mappings, osMapping{vendor: "linux", product: "linux_kernel"})
-		if kernelVersion != "" {
-			targets = append(targets, models.TargetItem{
-				AssetID:   assetID,
-				AssetType: assetType,
-				Vendor:    "linux",
-				Product:   "linux_kernel",
-				Version:   kernelVersion,
-			})
-		}
-	}
-
-	// Use the most specific version available
-	version := osVersion
-	if version == "" && kernelVersion != "" {
-		version = kernelVersion
-	}
-
-	for _, m := range mappings {
-		targets = append(targets, models.TargetItem{
-			AssetID:   assetID,
-			AssetType: assetType,
-			Vendor:    m.vendor,
-			Product:   m.product,
-			Version:   version,
-		})
-	}
-
-	return targets
-}
-
-// detectWindowsProduct attempts to map a Windows version string to its CPE product name
-func detectWindowsProduct(osLower, osVersion string) string {
-	// Try to detect from version string first
-	if osVersion != "" {
-		verParts := strings.Split(osVersion, ".")
-		if len(verParts) >= 2 {
-			major := verParts[0]
-			switch major {
-			case "10":
-				return "windows_10"
-			case "11":
-				return "windows_11"
-			case "6":
-				switch verParts[1] {
-				case "1":
-					return "windows_7"
-				case "2":
-					return "windows_8"
-				case "3":
-					return "windows_8_1"
-				}
-			case "5":
-				switch verParts[1] {
-				case "2":
-					return "windows_server_2003"
-				case "1":
-					return "windows_xp"
-				}
-			}
-		}
-	}
-
-	return "" // broad fallback
-}
-
-// parseSoftwareTargets extracts TargetItem entries from installed_software JSONB
-func parseSoftwareTargets(assetID uuid.UUID, assetType string, rawSoftware []byte) []models.TargetItem {
-	if rawSoftware == nil {
-		return nil
-	}
-
-	var list []models.TargetItem
-
-	// NEW: Try map of strings (key = name, value = version)
-	var strMap map[string]string
-	if err := json.Unmarshal(rawSoftware, &strMap); err == nil {
-		for name, version := range strMap {
-			// Infer vendor from name (optional) or leave empty
-			vendor := ""
-			// You could add heuristics, e.g., if strings.Contains(name, "VMware") -> vendor="vmware"
-			list = append(list, models.TargetItem{
-				AssetID:   assetID,
-				AssetType: assetType,
-				Vendor:    vendor,
-				Product:   name,
-				Version:   version,
-			})
-		}
-		return list
-	}
-
-	return nil
 }

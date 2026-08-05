@@ -15,6 +15,16 @@ import (
 	"nvd-engine/pkd/models"
 )
 
+// main is the entry point of the CVE matcher.
+//
+// It orchestrates the full pipeline:
+//  1. Connect to both databases (db package)
+//  2. Fetch assets from NeonDB (matcher.FetchAllTargetItems)
+//  3. Group targets by (vendor, product) for batched queries
+//  4. Match each group against NvdDB CVEs (matcher.MatchBatchTargets)
+//  5. Write findings to affected_assets (matcher.InsertFindings)
+//     6a. Create tickets for new findings (matcher.CreateTickets)
+//     6b. Send email notifications for new tickets (matcher.SendCveEmails)
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting NVD Asset Matcher...")
@@ -48,12 +58,26 @@ func main() {
 	log.Println("NVD Asset Matcher completed successfully")
 }
 
-// vendorProductKey is a unique key for grouping targets by vendor/product pair
+// vendorProductKey is a unique key for grouping targets by vendor/product pair.
+// Used to batch database queries so we query once per pair instead of once per asset.
 type vendorProductKey struct {
 	vendor  string
 	product string
 }
 
+// runMatching executes the core matching pipeline.
+//
+// Steps:
+//  1. Fetch all target assets from NeonDB (matcher.FetchAllTargetItems)
+//  2. Group targets by (vendor, product) to batch database queries
+//  3. Process each group in parallel (concurrency limited to 5)
+//     — each group calls matcher.MatchBatchTargets which:
+//     a. Looks up CVEs from NvdDB (cve_lookup.go)
+//     b. Matches each target in-memory (matcher.go, version.go)
+//  4. Collect all findings from all groups
+//  5. Insert findings into affected_assets (matcher.InsertFindings)
+//     6a. Create tickets in cve_ticket for new findings (matcher.CreateTickets)
+//     6b. Send email notifications for newly created tickets (matcher.SendCveEmails)
 func runMatching(ctx context.Context, dbs *db.Databases) error {
 	startTime := time.Now()
 	log.Println("Starting asset-CVE matching process...")
@@ -172,6 +196,22 @@ func runMatching(ctx context.Context, dbs *db.Databases) error {
 		log.Println("Inserting findings into affected_assets table...")
 		if err := matcher.InsertFindings(ctx, dbs, totalFindings); err != nil {
 			return err
+		}
+
+		// Step 6a: Create tickets for new findings
+		log.Println("Creating tickets for new findings...")
+		newTickets, err := matcher.CreateTickets(ctx, dbs, totalFindings)
+		if err != nil {
+			log.Printf("Error creating tickets: %v", err)
+			// Non-fatal — findings are already in affected_assets
+		}
+
+		// Step 6b: Send email notifications for newly created tickets
+		if len(newTickets) > 0 {
+			log.Printf("Sending %d email notifications...", len(newTickets))
+			matcher.SendCveEmails(newTickets)
+		} else {
+			log.Println("No new tickets to send notifications for")
 		}
 	}
 
